@@ -1232,7 +1232,7 @@ impl OsIpcReceiverSet {
         // read a complete message.
         loop {
             let mut nbytes: u32 = 0;
-            let mut reader_index: Option<usize> = None;
+            let reader_index;
             let mut io_err = winapi::ERROR_SUCCESS;
 
             unsafe {
@@ -1261,18 +1261,10 @@ impl OsIpcReceiverSet {
                 assert!(completion_key != INVALID_HANDLE_VALUE);
 
                 // Find the matching receiver
-                for (index, ref mut reader) in self.readers.iter_mut().enumerate() {
-                    if completion_key != *reader.handle {
-                        continue;
-                    }
-
-                    reader_index = Some(index);
-                    break;
-                }
-            }
-
-            if reader_index.is_none() {
-                panic!("Windows IPC ReceiverSet got notification for a receiver it doesn't know about");
+                let (index, _) = self.readers.iter().enumerate()
+                                 .find(|&(_, ref reader)| completion_key == *reader.handle)
+                                 .expect("Windows IPC ReceiverSet got notification for a receiver it doesn't know about");
+                reader_index = index;
             }
 
             let mut remove_index = None;
@@ -1280,7 +1272,6 @@ impl OsIpcReceiverSet {
             // We need a scope here for the mutable borrow of self.readers;
             // we need to (maybe) remove an element from it below.
             {
-                let reader_index = reader_index.unwrap();
                 let reader = &mut self.readers[reader_index];
 
                 win32_trace!("[# {:?}] result for receiver {:?}", *self.iocp, *reader.handle);
