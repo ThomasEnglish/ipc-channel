@@ -362,8 +362,10 @@ struct MessageReader {
     /// Whether we have already issued an async read.
     read_in_progress: bool,
 
-    /// Whether we received a BROKEN_PIPE or other error
-    /// indicating that the remote end has closed the pipe.
+    /// We got added to a receiver set
+    /// after the the sender end of the channel got closed --
+    /// so we need to report a "closed" event in the next `select()` call,
+    /// rather than actually waiting for data from this channel.
     closed: bool,
 
     /// ID identifying this reader within a receiver set.
@@ -476,8 +478,7 @@ impl MessageReader {
             },
             Err(winapi::ERROR_BROKEN_PIPE) => {
                 win32_trace!("[$ {:?}] BROKEN_PIPE straight from ReadFile", self.handle);
-                self.closed = true;
-                Ok(())
+                Err(WinError::ChannelClosed)
             },
             Err(err) => {
                 Err(WinError::from_system(err, "ReadFile"))
@@ -495,7 +496,9 @@ impl MessageReader {
     /// What's more, calling this while an async read is actually still in progress
     /// would have catastrophic effects,
     /// since the read buffer is still mutably aliased by the kernel in that case!
-    unsafe fn notify_completion(&mut self, err: u32) {
+    unsafe fn notify_completion(&mut self, err: u32) -> Result<(), WinError> {
+        assert!(!self.closed);
+
         win32_trace!("[$ {:?}] notify_completion", self.handle);
 
         // mark a read as no longer in progress even before we check errors
@@ -503,9 +506,7 @@ impl MessageReader {
 
         // Remote end closed the channel.
         if err == winapi::ERROR_BROKEN_PIPE {
-            assert!(!self.closed, "we shouldn't get an async BROKEN_PIPE after we already got one");
-            self.closed = true;
-            return;
+            return Err(WinError::ChannelClosed);
         }
 
         let nbytes = self.ov.InternalHigh as u32;
@@ -523,6 +524,8 @@ impl MessageReader {
             nbytes, offset, self.read_buf.len(), new_size, self.read_buf.capacity());
         assert!(new_size <= self.read_buf.capacity());
         self.read_buf.set_len(new_size);
+
+        Ok(())
     }
 
     /// Attempt to conclude an already issued async read operation.
@@ -560,9 +563,7 @@ impl MessageReader {
 
         // Notify that the read completed, which will update the
         // read pointers
-        self.notify_completion(err);
-
-        Ok(())
+        self.notify_completion(err)
     }
 
     fn get_message(&mut self) -> Result<Option<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>)>,
@@ -649,9 +650,15 @@ impl MessageReader {
             //
             // Note: just like in `OsIpcReceiver.receive_message()` below,
             // this actually leaks unsafety outside the `unsafe` block...
-            try!(self.start_read());
-
-            Ok(())
+            match self.start_read() {
+                Err(WinError::ChannelClosed) => {
+                    // If the sender has already been closed, we need to stash this information,
+                    // so we can report the corresponding event in the next `select()` call.
+                    self.closed = true;
+                    Ok(())
+                }
+                result => result,
+            }
         }
     }
 
@@ -669,16 +676,25 @@ impl MessageReader {
             // Because our handle is asynchronous, we have to do a two-part read --
             // first issue the operation, then wait for its completion.
             unsafe {
-                try!(self.start_read());
-                // Sender should not close until it sent as much data as we expect...
-                if self.closed {
-                    return Err(WinError::from_system(winapi::ERROR_BROKEN_PIPE, "ReadFile"));
-                }
-                // In blocking mode, this should never fail...
-                self.fetch_async_result(BlockingMode::Blocking).unwrap();
-                if self.closed {
-                    return Err(WinError::from_system(winapi::ERROR_BROKEN_PIPE, "ReadFile"));
-                }
+                match self.start_read() {
+                    Err(WinError::ChannelClosed) => {
+                        // If the helper channel closes unexpectedly
+                        // (i.e. before supplying the expected amount of data),
+                        // don't report that as a "sender closed" condition on the main channel:
+                        // rather, fail with the actual raw error code.
+                        return Err(WinError::from_system(winapi::ERROR_BROKEN_PIPE, "ReadFile"));
+                    }
+                    Err(err) => return Err(err),
+                    Ok(()) => {}
+                };
+                match self.fetch_async_result(BlockingMode::Blocking) {
+                    Err(WinError::ChannelClosed) => {
+                        return Err(WinError::from_system(winapi::ERROR_BROKEN_PIPE, "ReadFile"))
+                    }
+                    // In blocking mode, `fetch_async_result()` has no other expected failure modes.
+                    Err(_) => unreachable!(),
+                    Ok(()) => {}
+                };
             }
         }
 
@@ -837,12 +853,6 @@ impl OsIpcReceiver {
                 // messages, because getting a message modifies the read_buf.
                 try!(reader.start_read());
 
-                // If the last read flagged us closed we're done; we've already
-                // drained all incoming bytes earlier in the loop.
-                if reader.closed {
-                    return Err(WinError::ChannelClosed);
-                }
-
                 // May return `WinError::NoData` in non-blocking mode.
                 //
                 // The async read remains in flight in that case;
@@ -857,10 +867,6 @@ impl OsIpcReceiver {
                 // Unfortunately, there is nothing we can do about this,
                 // without totally changing the approach we use to handle the buffer...
                 try!(reader.fetch_async_result(blocking_mode));
-
-                if reader.closed {
-                    return Err(WinError::ChannelClosed);
-                }
             }
 
             // If we're not blocking, pretend that we are blocking, since we got part of
@@ -1278,9 +1284,15 @@ impl OsIpcReceiverSet {
                 win32_trace!("[# {:?}] result for receiver {:?}", *self.iocp, *reader.handle);
 
                 // tell it about the completed IO op
-                unsafe { reader.notify_completion(io_err); }
+                let mut closed = unsafe {
+                    match reader.notify_completion(io_err) {
+                        Ok(()) => false,
+                        Err(WinError::ChannelClosed) => true,
+                        Err(err) => return Err(err),
+                    }
+                };
 
-                if !reader.closed {
+                if !closed {
                     // Drain as many messages as we can.
                     while let Some((data, channels, shmems)) = try!(reader.get_message()) {
                         win32_trace!("[# {:?}] receiver {:?} ({}) got a message", *self.iocp, *reader.handle, reader.set_id.unwrap());
@@ -1290,7 +1302,13 @@ impl OsIpcReceiverSet {
 
                     // Now that we are done frobbing the buffer,
                     // we can safely initiate the next async read operation.
-                    unsafe { try!(reader.start_read()); }
+                    closed = unsafe {
+                        match reader.start_read() {
+                            Ok(()) => false,
+                            Err(WinError::ChannelClosed) => true,
+                            Err(err) => return Err(err),
+                        }
+                    };
                 }
 
                 // If we got a "sender closed" notification --
@@ -1298,7 +1316,7 @@ impl OsIpcReceiverSet {
                 // or while trying to re-initiate an async read after receiving data --
                 // add an event to this effect to the result list,
                 // and remove the reader in question from our set.
-                if reader.closed {
+                if closed {
                     win32_trace!("[# {:?}] receiver {:?} ({}) -- now closed!", *self.iocp, *reader.handle, reader.set_id.unwrap());
                     selection_results.push(OsIpcSelectionResult::ChannelClosed(reader.set_id.unwrap()));
                     remove_index = Some(reader_index);
