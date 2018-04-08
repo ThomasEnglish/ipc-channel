@@ -7,30 +7,29 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use serde;
 use bincode;
 use kernel32;
 use libc::intptr_t;
+use serde;
 use std::cell::{Cell, RefCell};
 use std::cmp::PartialEq;
 use std::default::Default;
 use std::env;
 use std::ffi::CString;
 use std::io::{Error, ErrorKind};
-use std::marker::{Send, Sync, PhantomData};
+use std::marker::{PhantomData, Send, Sync};
 use std::mem;
 use std::ops::{Deref, DerefMut, RangeFrom};
 use std::ptr;
 use std::slice;
 use std::thread;
 use uuid::Uuid;
-use winapi::{HANDLE, INVALID_HANDLE_VALUE, LPVOID};
 use winapi;
+use winapi::{HANDLE, INVALID_HANDLE_VALUE, LPVOID};
 
 lazy_static! {
     static ref CURRENT_PROCESS_ID: winapi::ULONG = unsafe { kernel32::GetCurrentProcessId() };
     static ref CURRENT_PROCESS_HANDLE: intptr_t = unsafe { kernel32::GetCurrentProcess() as intptr_t };
-
     static ref DEBUG_TRACE_ENABLED: bool = { env::var_os("IPC_CHANNEL_WIN_DEBUG_TRACE").is_some() };
 }
 
@@ -56,12 +55,19 @@ const PIPE_BUFFER_SIZE: usize = MAX_FRAGMENT_SIZE + 4 * 1024;
 
 #[allow(non_snake_case)]
 fn GetLastError() -> u32 {
-    unsafe {
-        kernel32::GetLastError()
-    }
+    unsafe { kernel32::GetLastError() }
 }
 
-pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver),WinError> {
+pub fn named_channel(name: String) -> Result<(OsIpcSender, OsIpcReceiver), WinError> {
+    let pipe_name = make_pipe_name(&Uuid::parse_str(&name).unwrap());
+
+    let receiver = try!(OsIpcReceiver::new_named(&pipe_name));
+    let sender = try!(OsIpcSender::connect_named(&pipe_name));
+
+    Ok((sender, receiver))
+}
+
+pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver), WinError> {
     let pipe_id = make_pipe_id();
     let pipe_name = make_pipe_name(&pipe_id);
 
@@ -109,7 +115,8 @@ impl<'data> Message<'data> {
     }
 
     fn data(&self) -> &[u8] {
-        &self.bytes[mem::size_of::<MessageHeader>()..(mem::size_of::<MessageHeader>() + self.data_len)]
+        &self.bytes
+            [mem::size_of::<MessageHeader>()..(mem::size_of::<MessageHeader>() + self.data_len)]
     }
 
     fn oob_bytes(&self) -> &[u8] {
@@ -118,7 +125,6 @@ impl<'data> Message<'data> {
 
     fn oob_data(&self) -> Option<OutOfBandMessage> {
         if self.oob_len > 0 {
-
             let oob = bincode::deserialize::<OutOfBandMessage>(self.oob_bytes())
                 .expect("Failed to deserialize OOB data");
             if oob.target_process_id != *CURRENT_PROCESS_ID {
@@ -178,26 +184,29 @@ impl OutOfBandMessage {
     }
 
     fn needs_to_be_sent(&self) -> bool {
-        !self.channel_handles.is_empty() ||
-        !self.shmem_handles.is_empty() ||
-        self.big_data_receiver_handle.is_some()
+        !self.channel_handles.is_empty() || !self.shmem_handles.is_empty()
+            || self.big_data_receiver_handle.is_some()
     }
 }
 
 impl serde::Serialize for OutOfBandMessage {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where S: serde::Serializer
+    where
+        S: serde::Serializer,
     {
-        ((self.target_process_id,
-          &self.channel_handles,
-          &self.shmem_handles,
-          &self.big_data_receiver_handle)).serialize(serializer)
+        ((
+            self.target_process_id,
+            &self.channel_handles,
+            &self.shmem_handles,
+            &self.big_data_receiver_handle,
+        )).serialize(serializer)
     }
 }
 
 impl<'de> serde::Deserialize<'de> for OutOfBandMessage {
     fn deserialize<D>(deserializer: D) -> Result<OutOfBandMessage, D::Error>
-        where D: serde::Deserializer<'de>
+    where
+        D: serde::Deserializer<'de>,
     {
         let (target_process_id, channel_handles, shmem_handles, big_data_receiver_handle) =
             try!(serde::Deserialize::deserialize(deserializer));
@@ -205,7 +214,7 @@ impl<'de> serde::Deserialize<'de> for OutOfBandMessage {
             target_process_id: target_process_id,
             channel_handles: channel_handles,
             shmem_handles: shmem_handles,
-            big_data_receiver_handle: big_data_receiver_handle
+            big_data_receiver_handle: big_data_receiver_handle,
         })
     }
 }
@@ -223,17 +232,25 @@ fn make_pipe_name(pipe_id: &Uuid) -> CString {
 ///
 /// Unlike win32 DuplicateHandle, this will preserve INVALID_HANDLE_VALUE (which is
 /// also the pseudohandle for the current process).
-unsafe fn dup_handle_to_process_with_flags(handle: HANDLE, other_process: HANDLE, flags: winapi::DWORD)
-                                    -> Result<HANDLE,WinError>
-{
+unsafe fn dup_handle_to_process_with_flags(
+    handle: HANDLE,
+    other_process: HANDLE,
+    flags: winapi::DWORD,
+) -> Result<HANDLE, WinError> {
     if handle == INVALID_HANDLE_VALUE {
         return Ok(INVALID_HANDLE_VALUE);
     }
 
     let mut new_handle: HANDLE = INVALID_HANDLE_VALUE;
-    let ok = kernel32::DuplicateHandle(*CURRENT_PROCESS_HANDLE as HANDLE, handle,
-                                       other_process, &mut new_handle,
-                                       0, winapi::FALSE, flags);
+    let ok = kernel32::DuplicateHandle(
+        *CURRENT_PROCESS_HANDLE as HANDLE,
+        handle,
+        other_process,
+        &mut new_handle,
+        0,
+        winapi::FALSE,
+        flags,
+    );
     if ok == winapi::FALSE {
         Err(WinError::last("DuplicateHandle"))
     } else {
@@ -242,36 +259,47 @@ unsafe fn dup_handle_to_process_with_flags(handle: HANDLE, other_process: HANDLE
 }
 
 /// Duplicate a handle in the current process.
-fn dup_handle(handle: &WinHandle) -> Result<WinHandle,WinError> {
+fn dup_handle(handle: &WinHandle) -> Result<WinHandle, WinError> {
     dup_handle_to_process(handle, &WinHandle::new(*CURRENT_PROCESS_HANDLE as HANDLE))
 }
 
 /// Duplicate a handle to the target process.
-fn dup_handle_to_process(handle: &WinHandle, other_process: &WinHandle) -> Result<WinHandle,WinError> {
+fn dup_handle_to_process(
+    handle: &WinHandle,
+    other_process: &WinHandle,
+) -> Result<WinHandle, WinError> {
     unsafe {
         let h = try!(dup_handle_to_process_with_flags(
-            **handle, **other_process, winapi::DUPLICATE_SAME_ACCESS));
+            **handle,
+            **other_process,
+            winapi::DUPLICATE_SAME_ACCESS
+        ));
         Ok(WinHandle::new(h))
     }
 }
 
 /// Duplicate a handle to the target process, closing the source handle.
-fn move_handle_to_process(mut handle: WinHandle, other_process: &WinHandle) -> Result<WinHandle,WinError> {
+fn move_handle_to_process(
+    mut handle: WinHandle,
+    other_process: &WinHandle,
+) -> Result<WinHandle, WinError> {
     unsafe {
         let h = try!(dup_handle_to_process_with_flags(
-            handle.take(), **other_process,
-            winapi::DUPLICATE_CLOSE_SOURCE | winapi::DUPLICATE_SAME_ACCESS));
+            handle.take(),
+            **other_process,
+            winapi::DUPLICATE_CLOSE_SOURCE | winapi::DUPLICATE_SAME_ACCESS
+        ));
         Ok(WinHandle::new(h))
     }
 }
 
 #[derive(Debug)]
 struct WinHandle {
-    h: HANDLE
+    h: HANDLE,
 }
 
-unsafe impl Send for WinHandle { }
-unsafe impl Sync for WinHandle { }
+unsafe impl Send for WinHandle {}
+unsafe impl Sync for WinHandle {}
 
 impl Drop for WinHandle {
     fn drop(&mut self) {
@@ -286,7 +314,9 @@ impl Drop for WinHandle {
 
 impl Default for WinHandle {
     fn default() -> WinHandle {
-        WinHandle { h: INVALID_HANDLE_VALUE }
+        WinHandle {
+            h: INVALID_HANDLE_VALUE,
+        }
     }
 }
 
@@ -321,7 +351,9 @@ impl WinHandle {
     }
 
     fn invalid() -> WinHandle {
-        WinHandle { h: INVALID_HANDLE_VALUE }
+        WinHandle {
+            h: INVALID_HANDLE_VALUE,
+        }
     }
 
     fn is_valid(&self) -> bool {
@@ -409,7 +441,7 @@ impl MessageReader {
     /// since it creates a mutable alias of `read_buf` inside the kernel,
     /// which is not tracked by Rust's type system,
     /// thus breaking the memory safetly guarantees Rust normally provides!
-    unsafe fn start_read(&mut self) -> Result<(),WinError> {
+    unsafe fn start_read(&mut self) -> Result<(), WinError> {
         // There is no valid reason to call this again after getting a channel closed notification.
         assert!(!self.closed);
 
@@ -434,11 +466,13 @@ impl MessageReader {
         let mut bytes_read: u32 = 0;
         let ok = {
             let remaining_buf = &mut self.read_buf[buf_len..];
-            kernel32::ReadFile(*self.handle,
-                               remaining_buf.as_mut_ptr() as LPVOID,
-                               remaining_buf.len() as u32,
-                               &mut bytes_read,
-                               self.ov.deref_mut())
+            kernel32::ReadFile(
+                *self.handle,
+                remaining_buf.as_mut_ptr() as LPVOID,
+                remaining_buf.len() as u32,
+                &mut bytes_read,
+                self.ov.deref_mut(),
+            )
         };
 
         // Reset the vector to only expose the already filled part.
@@ -471,18 +505,15 @@ impl MessageReader {
             // is still sent to the IO completion port that this
             // handle is part of, meaning that we don't have to do any
             // special handling for sync-completed operations.
-            Ok(()) |
-            Err(winapi::ERROR_IO_PENDING) => {
+            Ok(()) | Err(winapi::ERROR_IO_PENDING) => {
                 self.read_in_progress = true;
                 Ok(())
-            },
+            }
             Err(winapi::ERROR_BROKEN_PIPE) => {
                 win32_trace!("[$ {:?}] BROKEN_PIPE straight from ReadFile", self.handle);
                 Err(WinError::ChannelClosed)
-            },
-            Err(err) => {
-                Err(WinError::from_system(err, "ReadFile"))
-            },
+            }
+            Err(err) => Err(WinError::from_system(err, "ReadFile")),
         }
     }
 
@@ -516,12 +547,21 @@ impl MessageReader {
 
         if err != winapi::ERROR_SUCCESS {
             // This should never happen
-            panic!("[$ {:?}] *** notify_completion: unhandled error reported! {}", self.handle, err);
+            panic!(
+                "[$ {:?}] *** notify_completion: unhandled error reported! {}",
+                self.handle, err
+            );
         }
 
         let new_size = self.read_buf.len() + nbytes as usize;
-        win32_trace!("nbytes: {}, offset {}, buf len {}->{}, capacity {}",
-            nbytes, offset, self.read_buf.len(), new_size, self.read_buf.capacity());
+        win32_trace!(
+            "nbytes: {}, offset {}, buf len {}->{}, capacity {}",
+            nbytes,
+            offset,
+            self.read_buf.len(),
+            new_size,
+            self.read_buf.capacity()
+        );
         assert!(new_size <= self.read_buf.capacity());
         self.read_buf.set_len(new_size);
 
@@ -546,10 +586,8 @@ impl MessageReader {
             BlockingMode::Blocking => winapi::TRUE,
             BlockingMode::Nonblocking => winapi::FALSE,
         };
-        let ok = kernel32::GetOverlappedResult(*self.handle,
-                                               self.ov.deref_mut(),
-                                               &mut nbytes,
-                                               block);
+        let ok =
+            kernel32::GetOverlappedResult(*self.handle, self.ov.deref_mut(), &mut nbytes, block);
         if ok == winapi::FALSE {
             err = GetLastError();
             if blocking_mode == BlockingMode::Nonblocking && err == winapi::ERROR_IO_INCOMPLETE {
@@ -566,8 +604,9 @@ impl MessageReader {
         self.notify_completion(err)
     }
 
-    fn get_message(&mut self) -> Result<Option<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>)>,
-                                        WinError> {
+    fn get_message(
+        &mut self,
+    ) -> Result<Option<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>)>, WinError> {
         // We should never expect having pending data after receiving a channel closed notification.
         assert!(!self.closed);
 
@@ -594,7 +633,9 @@ impl MessageReader {
                     }
 
                     for sh in oob.shmem_handles.iter() {
-                        shmems.push(OsIpcSharedMemory::from_handle(sh.0 as HANDLE, sh.1 as usize).unwrap());
+                        shmems.push(
+                            OsIpcSharedMemory::from_handle(sh.0 as HANDLE, sh.1 as usize).unwrap(),
+                        );
                     }
 
                     if oob.big_data_receiver_handle.is_some() {
@@ -607,8 +648,13 @@ impl MessageReader {
 
             let buf_data = big_data.unwrap_or_else(|| message.data().to_vec());
 
-            win32_trace!("[$ {:?}] get_message success -> {} bytes, {} channels, {} shmems",
-                self.handle, buf_data.len(), channels.len(), shmems.len());
+            win32_trace!(
+                "[$ {:?}] get_message success -> {} bytes, {} channels, {} shmems",
+                self.handle,
+                buf_data.len(),
+                channels.len(),
+                shmems.len()
+            );
             drain_bytes = Some(message.size());
             result = Some((buf_data, channels, shmems));
         } else {
@@ -631,14 +677,16 @@ impl MessageReader {
         Ok(result)
     }
 
-    fn add_to_iocp(&mut self, iocp: &WinHandle, set_id: u64) -> Result<(),WinError> {
+    fn add_to_iocp(&mut self, iocp: &WinHandle, set_id: u64) -> Result<(), WinError> {
         unsafe {
             assert!(self.set_id.is_none());
 
-            let ret = kernel32::CreateIoCompletionPort(*self.handle,
-                                                       **iocp,
-                                                       *self.handle as winapi::ULONG_PTR,
-                                                       0);
+            let ret = kernel32::CreateIoCompletionPort(
+                *self.handle,
+                **iocp,
+                *self.handle as winapi::ULONG_PTR,
+                0,
+            );
             if ret.is_null() {
                 return Err(WinError::last("CreateIoCompletionPort"));
             }
@@ -668,7 +716,7 @@ impl MessageReader {
     /// and the transfer doesn't have our typical message framing.
     ///
     /// It's only valid to call this as the one and only call after creating a MessageReader.
-    fn read_raw_sized(mut self, size: usize) -> Result<Vec<u8>,WinError> {
+    fn read_raw_sized(mut self, size: usize) -> Result<Vec<u8>, WinError> {
         assert!(self.read_buf.len() == 0);
 
         self.read_buf.reserve(size);
@@ -711,7 +759,7 @@ enum AtomicMode {
 /// Write data to a handle.
 ///
 /// In `Atomic` mode, this panics if the data can't be written in a single system call.
-fn write_buf(handle: &WinHandle, bytes: &[u8], atomic: AtomicMode) -> Result<(),WinError> {
+fn write_buf(handle: &WinHandle, bytes: &[u8], atomic: AtomicMode) -> Result<(), WinError> {
     let total = bytes.len();
     if total == 0 {
         return Ok(());
@@ -722,12 +770,13 @@ fn write_buf(handle: &WinHandle, bytes: &[u8], atomic: AtomicMode) -> Result<(),
         let mut sz: u32 = 0;
         let bytes_to_write = &bytes[written..];
         unsafe {
-            if kernel32::WriteFile(**handle,
-                                   bytes_to_write.as_ptr() as LPVOID,
-                                   bytes_to_write.len() as u32,
-                                   &mut sz,
-                                   ptr::null_mut())
-                == winapi::FALSE
+            if kernel32::WriteFile(
+                **handle,
+                bytes_to_write.as_ptr() as LPVOID,
+                bytes_to_write.len() as u32,
+                &mut sz,
+                ptr::null_mut(),
+            ) == winapi::FALSE
             {
                 return Err(WinError::last("WriteFile"));
             }
@@ -738,10 +787,17 @@ fn write_buf(handle: &WinHandle, bytes: &[u8], atomic: AtomicMode) -> Result<(),
                 if written != total {
                     panic!("Windows IPC write_buf expected to write full buffer, but only wrote partial (wrote {} out of {} bytes)", written, total);
                 }
-            },
+            }
             AtomicMode::Nonatomic => {
-                win32_trace!("[c {:?}] ... wrote {} bytes, total {}/{} err {}", **handle, sz, written, total, GetLastError());
-            },
+                win32_trace!(
+                    "[c {:?}] ... wrote {} bytes, total {}/{} err {}",
+                    **handle,
+                    sz,
+                    written,
+                    total,
+                    GetLastError()
+                );
+            }
         }
     }
 
@@ -778,7 +834,7 @@ pub struct OsIpcReceiver {
 // in various places throughout `OsIpcReceiver` --
 // so for now, `OsIpcReceiver` needs to be considered responsible as a whole
 // for upholding the non-aliasing condition.
-unsafe impl Send for OsIpcReceiver { }
+unsafe impl Send for OsIpcReceiver {}
 
 impl PartialEq for OsIpcReceiver {
     fn eq(&self, other: &OsIpcReceiver) -> bool {
@@ -793,19 +849,27 @@ impl OsIpcReceiver {
         }
     }
 
-    fn new_named(pipe_name: &CString) -> Result<OsIpcReceiver,WinError> {
+    pub fn new(name: String) -> Result<OsIpcReceiver, WinError> {
+        let pipe_name = make_pipe_name(&Uuid::parse_str(&name).unwrap());
+        OsIpcReceiver::new_named(&pipe_name)
+    }
+
+    fn new_named(pipe_name: &CString) -> Result<OsIpcReceiver, WinError> {
         unsafe {
             // create the pipe server
-            let handle =
-                kernel32::CreateNamedPipeA(pipe_name.as_ptr(),
-                                           winapi::PIPE_ACCESS_INBOUND | winapi::FILE_FLAG_OVERLAPPED,
-                                           winapi::PIPE_TYPE_BYTE | winapi::PIPE_READMODE_BYTE | winapi::PIPE_REJECT_REMOTE_CLIENTS,
-                                           // 1 max instance of this pipe
-                                           1,
-                                           // out/in buffer sizes
-                                           0, PIPE_BUFFER_SIZE as u32,
-                                           0, // default timeout for WaitNamedPipe (0 == 50ms as default)
-                                           ptr::null_mut());
+            let handle = kernel32::CreateNamedPipeA(
+                pipe_name.as_ptr(),
+                winapi::PIPE_ACCESS_INBOUND | winapi::FILE_FLAG_OVERLAPPED,
+                winapi::PIPE_TYPE_BYTE | winapi::PIPE_READMODE_BYTE
+                    | winapi::PIPE_REJECT_REMOTE_CLIENTS,
+                // 1 max instance of this pipe
+                1,
+                // out/in buffer sizes
+                0,
+                PIPE_BUFFER_SIZE as u32,
+                0, // default timeout for WaitNamedPipe (0 == 50ms as default)
+                ptr::null_mut(),
+            );
             if handle == INVALID_HANDLE_VALUE {
                 return Err(WinError::last("CreateNamedPipeA"));
             }
@@ -816,7 +880,7 @@ impl OsIpcReceiver {
         }
     }
 
-    fn prepare_for_transfer(&self) -> Result<bool,WinError> {
+    fn prepare_for_transfer(&self) -> Result<bool, WinError> {
         let mut reader = self.reader.borrow_mut();
         // cancel any outstanding IO request
         reader.cancel_io();
@@ -833,10 +897,15 @@ impl OsIpcReceiver {
     // This is only used for recv/try_recv.  When this is added to an IpcReceiverSet, then
     // the implementation in select() is used.  It does much the same thing, but across multiple
     // channels.
-    fn receive_message(&self, mut blocking_mode: BlockingMode)
-                       -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
+    fn receive_message(
+        &self,
+        mut blocking_mode: BlockingMode,
+    ) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), WinError> {
         let mut reader = self.reader.borrow_mut();
-        assert!(reader.set_id.is_none(), "receive_message is only valid before this OsIpcReceiver was added to a Set");
+        assert!(
+            reader.set_id.is_none(),
+            "receive_message is only valid before this OsIpcReceiver was added to a Set"
+        );
 
         // This function loops, because in the case of a blocking read, we may need to
         // read multiple sets of bytes from the pipe to receive a complete message.
@@ -875,14 +944,16 @@ impl OsIpcReceiver {
         }
     }
 
-    pub fn recv(&self)
-                -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
+    pub fn recv(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), WinError> {
         win32_trace!("recv");
         self.receive_message(BlockingMode::Blocking)
     }
 
-    pub fn try_recv(&self)
-                    -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
+    pub fn try_recv(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), WinError> {
         win32_trace!("try_recv");
         self.receive_message(BlockingMode::Nonblocking)
     }
@@ -890,7 +961,7 @@ impl OsIpcReceiver {
     /// Do a pipe connect.
     ///
     /// Only used for one-shot servers.
-    fn accept(&self) -> Result<(),WinError> {
+    fn accept(&self) -> Result<(), WinError> {
         unsafe {
             let reader_borrow = self.reader.borrow();
             let handle = &reader_borrow.handle;
@@ -906,7 +977,7 @@ impl OsIpcReceiver {
                 winapi::ERROR_PIPE_CONNECTED => {
                     win32_trace!("[$ {:?}] accept (PIPE_CONNECTED)", **handle);
                     Ok(())
-                },
+                }
 
                 // This is a weird one -- if we create a named pipe (like we do
                 // in new() ), the client connects, sends data, then drops its handle,
@@ -916,23 +987,24 @@ impl OsIpcReceiver {
                 winapi::ERROR_NO_DATA => {
                     win32_trace!("[$ {:?}] accept (ERROR_NO_DATA)", **handle);
                     Ok(())
-                },
+                }
 
                 // the connect is pending; wait for it to complete
                 winapi::ERROR_IO_PENDING => {
                     let mut nbytes: u32 = 0;
-                    let ok = kernel32::GetOverlappedResult(**handle, &mut ov, &mut nbytes, winapi::TRUE);
+                    let ok =
+                        kernel32::GetOverlappedResult(**handle, &mut ov, &mut nbytes, winapi::TRUE);
                     if ok == winapi::FALSE {
                         return Err(WinError::last("GetOverlappedResult[ConnectNamedPipe]"));
                     }
                     Ok(())
-                },
+                }
 
                 // Anything else signifies some actual I/O error.
                 err => {
                     win32_trace!("[$ {:?}] accept error -> {}", **handle, err);
                     Err(WinError::last("ConnectNamedPipe"))
-                },
+                }
             }
         }
     }
@@ -966,7 +1038,7 @@ impl Clone for OsIpcSender {
 }
 
 impl OsIpcSender {
-    pub fn connect(name: String) -> Result<OsIpcSender,WinError> {
+    pub fn connect(name: String) -> Result<OsIpcSender, WinError> {
         let pipe_name = make_pipe_name(&Uuid::parse_str(&name).unwrap());
         OsIpcSender::connect_named(&pipe_name)
     }
@@ -983,16 +1055,17 @@ impl OsIpcSender {
     }
 
     /// Connect to a pipe server.
-    fn connect_named(pipe_name: &CString) -> Result<OsIpcSender,WinError> {
+    fn connect_named(pipe_name: &CString) -> Result<OsIpcSender, WinError> {
         unsafe {
-            let handle =
-                kernel32::CreateFileA(pipe_name.as_ptr(),
-                                      winapi::GENERIC_WRITE,
-                                      0,
-                                      ptr::null_mut(), // lpSecurityAttributes
-                                      winapi::OPEN_EXISTING,
-                                      winapi::FILE_ATTRIBUTE_NORMAL,
-                                      ptr::null_mut());
+            let handle = kernel32::CreateFileA(
+                pipe_name.as_ptr(),
+                winapi::GENERIC_WRITE,
+                0,
+                ptr::null_mut(), // lpSecurityAttributes
+                winapi::OPEN_EXISTING,
+                winapi::FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            );
             if handle == INVALID_HANDLE_VALUE {
                 return Err(WinError::last("CreateFileA"));
             }
@@ -1003,26 +1076,34 @@ impl OsIpcSender {
         }
     }
 
-    fn get_pipe_server_process_id(&self) -> Result<winapi::ULONG,WinError> {
+    fn get_pipe_server_process_id(&self) -> Result<winapi::ULONG, WinError> {
         unsafe {
             let mut server_pid: winapi::ULONG = 0;
-            if kernel32::GetNamedPipeServerProcessId(*self.handle, &mut server_pid) == winapi::FALSE {
+            if kernel32::GetNamedPipeServerProcessId(*self.handle, &mut server_pid) == winapi::FALSE
+            {
                 return Err(WinError::last("GetNamedPipeServerProcessId"));
             }
             Ok(server_pid)
         }
     }
 
-    fn get_pipe_server_process_handle_and_pid(&self) -> Result<(WinHandle, winapi::ULONG),WinError> {
+    fn get_pipe_server_process_handle_and_pid(
+        &self,
+    ) -> Result<(WinHandle, winapi::ULONG), WinError> {
         unsafe {
             let server_pid = try!(self.get_pipe_server_process_id());
             if server_pid == *CURRENT_PROCESS_ID {
-                return Ok((WinHandle::new(*CURRENT_PROCESS_HANDLE as HANDLE), server_pid));
+                return Ok((
+                    WinHandle::new(*CURRENT_PROCESS_HANDLE as HANDLE),
+                    server_pid,
+                ));
             }
 
-            let raw_handle = kernel32::OpenProcess(winapi::PROCESS_DUP_HANDLE,
-                                                   winapi::FALSE,
-                                                   server_pid as winapi::DWORD);
+            let raw_handle = kernel32::OpenProcess(
+                winapi::PROCESS_DUP_HANDLE,
+                winapi::FALSE,
+                server_pid as winapi::DWORD,
+            );
             if raw_handle.is_null() {
                 return Err(WinError::last("OpenProcess"));
             }
@@ -1032,19 +1113,32 @@ impl OsIpcSender {
     }
 
     fn needs_fragmentation(data_len: usize, oob: &OutOfBandMessage) -> bool {
-        let oob_size = if oob.needs_to_be_sent() { bincode::serialized_size(oob) } else { 0 };
+        let oob_size = if oob.needs_to_be_sent() {
+            bincode::serialized_size(oob)
+        } else {
+            0
+        };
 
         // make sure we don't have too much oob data to begin with
-        assert!((oob_size as usize) <= (PIPE_BUFFER_SIZE - mem::size_of::<MessageHeader>()), "too much oob data");
+        assert!(
+            (oob_size as usize) <= (PIPE_BUFFER_SIZE - mem::size_of::<MessageHeader>()),
+            "too much oob data"
+        );
 
-        let bytes_left_for_data = (PIPE_BUFFER_SIZE - mem::size_of::<MessageHeader>()) - (oob_size as usize);
+        let bytes_left_for_data =
+            (PIPE_BUFFER_SIZE - mem::size_of::<MessageHeader>()) - (oob_size as usize);
         data_len >= bytes_left_for_data
     }
 
     /// An internal-use-only send method that sends just raw data, with no header.
-    fn send_raw(&self, data: &[u8]) -> Result<(),WinError> {
-        win32_trace!("[c {:?}] writing {} bytes raw to (pid {}->{})", *self.handle, data.len(), *CURRENT_PROCESS_ID,
-             try!(self.get_pipe_server_process_id()));
+    fn send_raw(&self, data: &[u8]) -> Result<(), WinError> {
+        win32_trace!(
+            "[c {:?}] writing {} bytes raw to (pid {}->{})",
+            *self.handle,
+            data.len(),
+            *CURRENT_PROCESS_ID,
+            try!(self.get_pipe_server_process_id())
+        );
 
         // Write doesn't need to be atomic,
         // since the pipe is exclusive for this message,
@@ -1052,12 +1146,12 @@ impl OsIpcSender {
         write_buf(&self.handle, data, AtomicMode::Nonatomic)
     }
 
-    pub fn send(&self,
-                data: &[u8],
-                ports: Vec<OsIpcChannel>,
-                shared_memory_regions: Vec<OsIpcSharedMemory>)
-                -> Result<(),WinError>
-    {
+    pub fn send(
+        &self,
+        data: &[u8],
+        ports: Vec<OsIpcChannel>,
+        shared_memory_regions: Vec<OsIpcSharedMemory>,
+    ) -> Result<(), WinError> {
         // We limit the max size we can send here; we can fix this
         // just by upping the header to be 2x u64 if we really want
         // to.
@@ -1074,15 +1168,17 @@ impl OsIpcSender {
         for ref shmem in shared_memory_regions {
             // shmem.handle, shmem.length
             let mut remote_handle = try!(dup_handle_to_process(&shmem.handle, &server_h));
-            oob.shmem_handles.push((remote_handle.take() as intptr_t, shmem.length as u64));
+            oob.shmem_handles
+                .push((remote_handle.take() as intptr_t, shmem.length as u64));
         }
 
         for port in ports {
             match port {
                 OsIpcChannel::Sender(s) => {
                     let mut raw_remote_handle = try!(move_handle_to_process(s.handle, &server_h));
-                    oob.channel_handles.push(raw_remote_handle.take() as intptr_t);
-                },
+                    oob.channel_handles
+                        .push(raw_remote_handle.take() as intptr_t);
+                }
                 OsIpcChannel::Receiver(r) => {
                     if try!(r.prepare_for_transfer()) == false {
                         panic!("Sending receiver with outstanding partial read buffer, noooooo!  What should even happen?");
@@ -1090,8 +1186,9 @@ impl OsIpcSender {
 
                     let handle = WinHandle::new(r.reader.into_inner().handle.take());
                     let mut raw_remote_handle = try!(move_handle_to_process(handle, &server_h));
-                    oob.channel_handles.push(raw_remote_handle.take() as intptr_t);
-                },
+                    oob.channel_handles
+                        .push(raw_remote_handle.take() as intptr_t);
+                }
             }
         }
 
@@ -1110,7 +1207,8 @@ impl OsIpcSender {
                 // Put the receiver in the OOB data
                 let handle = WinHandle::new(receiver.reader.into_inner().handle.take());
                 let mut raw_receiver_handle = try!(move_handle_to_process(handle, &server_h));
-                oob.big_data_receiver_handle = Some((raw_receiver_handle.take() as intptr_t, data.len() as u64));
+                oob.big_data_receiver_handle =
+                    Some((raw_receiver_handle.take() as intptr_t, data.len() as u64));
                 oob.target_process_id = server_pid;
 
                 Some(sender)
@@ -1124,18 +1222,23 @@ impl OsIpcSender {
             oob_data = bincode::serialize(&oob, bincode::Infinite).unwrap();
         }
 
-        let in_band_data_len = if big_data_sender.is_none() { data.len() } else { 0 };
+        let in_band_data_len = if big_data_sender.is_none() {
+            data.len()
+        } else {
+            0
+        };
         let header = MessageHeader {
             data_len: in_band_data_len as u32,
-            oob_len: oob_data.len() as u32
+            oob_len: oob_data.len() as u32,
         };
         let full_in_band_len = header.total_message_bytes_needed();
         assert!(full_in_band_len <= PIPE_BUFFER_SIZE);
         let mut full_message = Vec::<u8>::with_capacity(full_in_band_len);
 
         {
-            let header_bytes = unsafe { slice::from_raw_parts(&header as *const _ as *const u8,
-                                                              mem::size_of_val(&header)) };
+            let header_bytes = unsafe {
+                slice::from_raw_parts(&header as *const _ as *const u8, mem::size_of_val(&header))
+            };
             full_message.extend_from_slice(header_bytes);
         }
 
@@ -1161,7 +1264,12 @@ impl OsIpcSender {
 }
 
 pub enum OsIpcSelectionResult {
-    DataReceived(u64, Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),
+    DataReceived(
+        u64,
+        Vec<u8>,
+        Vec<OsOpaqueIpcChannel>,
+        Vec<OsIpcSharedMemory>,
+    ),
     ChannelClosed(u64),
 }
 
@@ -1177,12 +1285,14 @@ pub struct OsIpcReceiverSet {
 }
 
 impl OsIpcReceiverSet {
-    pub fn new() -> Result<OsIpcReceiverSet,WinError> {
+    pub fn new() -> Result<OsIpcReceiverSet, WinError> {
         unsafe {
-            let iocp = kernel32::CreateIoCompletionPort(INVALID_HANDLE_VALUE,
-                                                        ptr::null_mut(),
-                                                        0 as winapi::ULONG_PTR,
-                                                        0);
+            let iocp = kernel32::CreateIoCompletionPort(
+                INVALID_HANDLE_VALUE,
+                ptr::null_mut(),
+                0 as winapi::ULONG_PTR,
+                0,
+            );
             if iocp.is_null() {
                 return Err(WinError::last("CreateIoCompletionPort"));
             }
@@ -1195,23 +1305,32 @@ impl OsIpcReceiverSet {
         }
     }
 
-    pub fn add(&mut self, receiver: OsIpcReceiver) -> Result<u64,WinError> {
+    pub fn add(&mut self, receiver: OsIpcReceiver) -> Result<u64, WinError> {
         // consume the receiver, and take the reader out
         let mut reader = receiver.reader.into_inner();
 
         let set_id = self.incrementor.next().unwrap();
         try!(reader.add_to_iocp(&self.iocp, set_id));
 
-        win32_trace!("[# {:?}] ReceiverSet add {:?}, id {}", *self.iocp, *reader.handle, set_id);
+        win32_trace!(
+            "[# {:?}] ReceiverSet add {:?}, id {}",
+            *self.iocp,
+            *reader.handle,
+            set_id
+        );
 
         self.readers.push(reader);
 
         Ok(set_id)
     }
 
-    pub fn select(&mut self) -> Result<Vec<OsIpcSelectionResult>,WinError> {
+    pub fn select(&mut self) -> Result<Vec<OsIpcSelectionResult>, WinError> {
         assert!(!self.readers.is_empty(), "selecting with no objects?");
-        win32_trace!("[# {:?}] select() with {} receivers", *self.iocp, self.readers.len());
+        win32_trace!(
+            "[# {:?}] select() with {} receivers",
+            *self.iocp,
+            self.readers.len()
+        );
 
         // the ultimate results
         let mut selection_results = vec![];
@@ -1246,12 +1365,20 @@ impl OsIpcReceiverSet {
                 let mut completion_key: HANDLE = INVALID_HANDLE_VALUE;
                 let mut ov_ptr: *mut winapi::OVERLAPPED = ptr::null_mut();
                 // XXX use GetQueuedCompletionStatusEx to dequeue multiple CP at once!
-                let ok = kernel32::GetQueuedCompletionStatus(*self.iocp,
-                                                             &mut nbytes,
-                                                             &mut completion_key as *mut _ as *mut winapi::ULONG_PTR,
-                                                             &mut ov_ptr,
-                                                             winapi::INFINITE);
-                win32_trace!("[# {:?}] GetQueuedCS -> ok:{} nbytes:{} key:{:?}", *self.iocp, ok, nbytes, completion_key);
+                let ok = kernel32::GetQueuedCompletionStatus(
+                    *self.iocp,
+                    &mut nbytes,
+                    &mut completion_key as *mut _ as *mut winapi::ULONG_PTR,
+                    &mut ov_ptr,
+                    winapi::INFINITE,
+                );
+                win32_trace!(
+                    "[# {:?}] GetQueuedCS -> ok:{} nbytes:{} key:{:?}",
+                    *self.iocp,
+                    ok,
+                    nbytes,
+                    completion_key
+                );
                 if ok == winapi::FALSE {
                     // If the OVERLAPPED result is NULL, then the
                     // function call itself failed or timed out.
@@ -1281,7 +1408,11 @@ impl OsIpcReceiverSet {
             {
                 let reader = &mut self.readers[reader_index];
 
-                win32_trace!("[# {:?}] result for receiver {:?}", *self.iocp, *reader.handle);
+                win32_trace!(
+                    "[# {:?}] result for receiver {:?}",
+                    *self.iocp,
+                    *reader.handle
+                );
 
                 // tell it about the completed IO op
                 let mut closed = unsafe {
@@ -1295,10 +1426,25 @@ impl OsIpcReceiverSet {
                 if !closed {
                     // Drain as many messages as we can.
                     while let Some((data, channels, shmems)) = try!(reader.get_message()) {
-                        win32_trace!("[# {:?}] receiver {:?} ({}) got a message", *self.iocp, *reader.handle, reader.set_id.unwrap());
-                        selection_results.push(OsIpcSelectionResult::DataReceived(reader.set_id.unwrap(), data, channels, shmems));
+                        win32_trace!(
+                            "[# {:?}] receiver {:?} ({}) got a message",
+                            *self.iocp,
+                            *reader.handle,
+                            reader.set_id.unwrap()
+                        );
+                        selection_results.push(OsIpcSelectionResult::DataReceived(
+                            reader.set_id.unwrap(),
+                            data,
+                            channels,
+                            shmems,
+                        ));
                     }
-                    win32_trace!("[# {:?}] receiver {:?} ({}) -- no message", *self.iocp, *reader.handle, reader.set_id.unwrap());
+                    win32_trace!(
+                        "[# {:?}] receiver {:?} ({}) -- no message",
+                        *self.iocp,
+                        *reader.handle,
+                        reader.set_id.unwrap()
+                    );
 
                     // Now that we are done frobbing the buffer,
                     // we can safely initiate the next async read operation.
@@ -1317,8 +1463,14 @@ impl OsIpcReceiverSet {
                 // add an event to this effect to the result list,
                 // and remove the reader in question from our set.
                 if closed {
-                    win32_trace!("[# {:?}] receiver {:?} ({}) -- now closed!", *self.iocp, *reader.handle, reader.set_id.unwrap());
-                    selection_results.push(OsIpcSelectionResult::ChannelClosed(reader.set_id.unwrap()));
+                    win32_trace!(
+                        "[# {:?}] receiver {:?} ({}) -- now closed!",
+                        *self.iocp,
+                        *reader.handle,
+                        reader.set_id.unwrap()
+                    );
+                    selection_results
+                        .push(OsIpcSelectionResult::ChannelClosed(reader.set_id.unwrap()));
                     remove_index = Some(reader_index);
                 }
             }
@@ -1340,14 +1492,22 @@ impl OsIpcReceiverSet {
 }
 
 impl OsIpcSelectionResult {
-    pub fn unwrap(self) -> (u64, Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>) {
+    pub fn unwrap(
+        self,
+    ) -> (
+        u64,
+        Vec<u8>,
+        Vec<OsOpaqueIpcChannel>,
+        Vec<OsIpcSharedMemory>,
+    ) {
         match self {
             OsIpcSelectionResult::DataReceived(id, data, channels, shared_memory_regions) => {
                 (id, data, channels, shared_memory_regions)
             }
-            OsIpcSelectionResult::ChannelClosed(id) => {
-                panic!("OsIpcSelectionResult::unwrap(): receiver ID {} was closed!", id)
-            }
+            OsIpcSelectionResult::ChannelClosed(id) => panic!(
+                "OsIpcSelectionResult::unwrap(): receiver ID {} was closed!",
+                id
+            ),
         }
     }
 }
@@ -1399,24 +1559,26 @@ impl Deref for OsIpcSharedMemory {
     #[inline]
     fn deref(&self) -> &[u8] {
         assert!(!self.ptr.is_null() && self.handle.is_valid());
-        unsafe {
-            slice::from_raw_parts(self.ptr, self.length)
-        }
+        unsafe { slice::from_raw_parts(self.ptr, self.length) }
     }
 }
 
 impl OsIpcSharedMemory {
-    fn new(length: usize) -> Result<OsIpcSharedMemory,WinError> {
+    fn new(length: usize) -> Result<OsIpcSharedMemory, WinError> {
         unsafe {
             assert!(length < u32::max_value() as usize);
-            let (lhigh, llow) = (length.checked_shr(32).unwrap_or(0) as u32,
-                                 (length & 0xffffffff) as u32);
-            let handle =
-                kernel32::CreateFileMappingA(INVALID_HANDLE_VALUE,
-                                             ptr::null_mut(),
-                                             winapi::PAGE_READWRITE | winapi::SEC_COMMIT,
-                                             lhigh, llow,
-                                             ptr::null_mut());
+            let (lhigh, llow) = (
+                length.checked_shr(32).unwrap_or(0) as u32,
+                (length & 0xffffffff) as u32,
+            );
+            let handle = kernel32::CreateFileMappingA(
+                INVALID_HANDLE_VALUE,
+                ptr::null_mut(),
+                winapi::PAGE_READWRITE | winapi::SEC_COMMIT,
+                lhigh,
+                llow,
+                ptr::null_mut(),
+            );
             if handle == INVALID_HANDLE_VALUE {
                 return Err(WinError::last("CreateFileMapping"));
             }
@@ -1431,13 +1593,14 @@ impl OsIpcSharedMemory {
     //
     // This function takes ownership of the handle, and will close it
     // when finished.
-    unsafe fn from_handle(handle_raw: HANDLE, length: usize) -> Result<OsIpcSharedMemory,WinError> {
+    unsafe fn from_handle(
+        handle_raw: HANDLE,
+        length: usize,
+    ) -> Result<OsIpcSharedMemory, WinError> {
         // turn this into a WinHandle, because that will
         // take care of closing it
         let handle = WinHandle::new(handle_raw);
-        let address = kernel32::MapViewOfFile(handle_raw,
-                                              winapi::FILE_MAP_ALL_ACCESS,
-                                              0, 0, 0);
+        let address = kernel32::MapViewOfFile(handle_raw, winapi::FILE_MAP_ALL_ACCESS, 0, 0, 0);
         if address.is_null() {
             return Err(WinError::last("MapViewOfFile"));
         }
@@ -1445,7 +1608,7 @@ impl OsIpcSharedMemory {
         Ok(OsIpcSharedMemory {
             handle: handle,
             ptr: address as *mut u8,
-            length: length
+            length: length,
         })
     }
 
@@ -1475,22 +1638,27 @@ pub struct OsIpcOneShotServer {
 }
 
 impl OsIpcOneShotServer {
-    pub fn new() -> Result<(OsIpcOneShotServer, String),WinError> {
+    pub fn new() -> Result<(OsIpcOneShotServer, String), WinError> {
         let pipe_id = make_pipe_id();
         let pipe_name = make_pipe_name(&pipe_id);
         let receiver = try!(OsIpcReceiver::new_named(&pipe_name));
         Ok((
-            OsIpcOneShotServer {
-                receiver: receiver,
-            },
-            pipe_id.to_string()
+            OsIpcOneShotServer { receiver: receiver },
+            pipe_id.to_string(),
         ))
     }
 
-    pub fn accept(self) -> Result<(OsIpcReceiver,
-                                   Vec<u8>,
-                                   Vec<OsOpaqueIpcChannel>,
-                                   Vec<OsIpcSharedMemory>),WinError> {
+    pub fn accept(
+        self,
+    ) -> Result<
+        (
+            OsIpcReceiver,
+            Vec<u8>,
+            Vec<OsOpaqueIpcChannel>,
+            Vec<OsIpcSharedMemory>,
+        ),
+        WinError,
+    > {
         let receiver = self.receiver;
         try!(receiver.accept());
         let (data, channels, shmems) = try!(receiver.recv());
@@ -1521,9 +1689,7 @@ impl Drop for OsOpaqueIpcChannel {
 
 impl OsOpaqueIpcChannel {
     fn new(handle: HANDLE) -> OsOpaqueIpcChannel {
-        OsOpaqueIpcChannel {
-            handle: handle,
-        }
+        OsOpaqueIpcChannel { handle: handle }
     }
 
     pub fn to_receiver(&mut self) -> OsIpcReceiver {
@@ -1550,34 +1716,45 @@ impl WinError {
         let mut buf = [0 as winapi::WCHAR; 2048];
 
         unsafe {
-            let res = kernel32::FormatMessageW(winapi::FORMAT_MESSAGE_FROM_SYSTEM |
-                                               winapi::FORMAT_MESSAGE_IGNORE_INSERTS,
-                                               ptr::null_mut(),
-                                               errnum as winapi::DWORD,
-                                               lang_id,
-                                               buf.as_mut_ptr(),
-                                               buf.len() as winapi::DWORD,
-                                               ptr::null_mut()) as usize;
+            let res = kernel32::FormatMessageW(
+                winapi::FORMAT_MESSAGE_FROM_SYSTEM | winapi::FORMAT_MESSAGE_IGNORE_INSERTS,
+                ptr::null_mut(),
+                errnum as winapi::DWORD,
+                lang_id,
+                buf.as_mut_ptr(),
+                buf.len() as winapi::DWORD,
+                ptr::null_mut(),
+            ) as usize;
             if res == 0 {
                 // Sometimes FormatMessageW can fail e.g. system doesn't like lang_id,
                 let fm_err = kernel32::GetLastError();
-                return format!("OS Error {} (FormatMessageW() returned error {})",
-                               errnum, fm_err);
+                return format!(
+                    "OS Error {} (FormatMessageW() returned error {})",
+                    errnum, fm_err
+                );
             }
 
             match String::from_utf16(&buf[..res]) {
                 Ok(msg) => {
                     // Trim trailing CRLF inserted by FormatMessageW
                     msg.trim().to_string()
-                },
-                Err(..) => format!("OS Error {} (FormatMessageW() returned \
-                                    invalid UTF-16)", errnum),
+                }
+                Err(..) => format!(
+                    "OS Error {} (FormatMessageW() returned \
+                     invalid UTF-16)",
+                    errnum
+                ),
             }
         }
     }
 
     fn from_system(err: u32, f: &str) -> WinError {
-        win32_trace!("WinError: {} ({}) from {}", WinError::error_string(err), err, f);
+        win32_trace!(
+            "WinError: {} ({}) from {}",
+            WinError::error_string(err),
+            err,
+            f
+        );
         WinError::WindowsResult(err)
     }
 
@@ -1604,13 +1781,11 @@ impl From<WinError> for Error {
                 // to signal the "channel closed" (no sender) condition --
                 // so hand it back to the Windows API to create an appropriate `Error` value.
                 Error::from_raw_os_error(winapi::ERROR_BROKEN_PIPE as i32)
-            },
+            }
             WinError::NoData => {
                 Error::new(ErrorKind::WouldBlock, "Win channel has no data available")
-            },
-            WinError::WindowsResult(err) => {
-                Error::from_raw_os_error(err as i32)
-            },
+            }
+            WinError::WindowsResult(err) => Error::from_raw_os_error(err as i32),
         }
     }
 }
